@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Domain Finder</title>
+<style>
+  :root { --ink:#1d2433; --muted:#6b7385; --line:#e3e6ee; --accent:#2f5bea; --bg:#f7f8fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", system-ui, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width: 860px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  #drop { border:2px dashed var(--line); border-radius:8px; padding:28px; text-align:center; color:var(--muted); cursor:pointer; }
+  #drop.over { border-color: var(--accent); color: var(--accent); }
+  textarea { width:100%; height:120px; margin-top:12px; border:1px solid var(--line); border-radius:8px; padding:10px; font:inherit; resize:vertical; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; font-size:14px; }
+  select, input[type=password] { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:9px 16px; font:inherit; cursor:pointer; }
+  button.secondary { background:#fff; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:12px 0 6px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition: width .2s; }
+  #status { font-size:14px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .pill { font-size:12px; padding:2px 8px; border-radius:10px; background:#eef2ff; color:var(--accent); }
+  .miss { color:#b4495a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Domain Finder</h1>
+  <p class="sub">Drop a CSV or paste company names. Free sources run first, then Cognism, then Clay for anything left.</p>
+
+  <div class="card">
+    <div id="drop">Drop a CSV here or click to choose one<input id="file" type="file" accept=".csv,.txt" hidden /></div>
+    <textarea id="paste" placeholder="Or paste one company per line"></textarea>
+    <div class="row">
+      <label>Company column <select id="col"><option value="">(paste / first column)</option></select></label>
+      <label>Access code <input id="code" type="password" /></label>
+      <label id="clayWrap" hidden><input id="useClay" type="checkbox" checked /> Send misses to Clay</label>
+    </div>
+    <div class="row">
+      <button id="go">Find domains</button>
+      <button id="dl" class="secondary" disabled>Download CSV</button>
+      <span id="sources" class="pill"></span>
+    </div>
+    <div class="bar"><div id="fill"></div></div>
+    <div id="status">Waiting for a list.</div>
+  </div>
+
+  <div class="card" id="resultsCard" hidden>
+    <table><thead><tr><th>Company</th><th>Domain</th><th>Source</th></tr></thead><tbody id="tbody"></tbody></table>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let csvRows = null, headers = [], results = new Map(), config = {};
+$('code').value = localStorage.getItem('df_code') || '';
+
+fetch('/api/config').then(r => r.json()).then(c => {
+  config = c;
+  $('sources').textContent = ['Clearbit', c.cognism && 'Cognism', c.clay && 'Clay'].filter(Boolean).join(' → ');
+  $('clayWrap').hidden = !c.clay;
+});
+
+// ---------- CSV parsing / writing ----------
+function parseCSV(text) {
+  const rows = []; let row = [], f = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) {
+      if (ch === '"' && text[i + 1] === '"') { f += '"'; i++; }
+      else if (ch === '"') q = false;
+      else f += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === ',') { row.push(f); f = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(f); rows.push(row); row = []; f = '';
+    } else f += ch;
+  }
+  if (f || row.length) { row.push(f); rows.push(row); }
+  return rows.filter(r => r.some(c => c.trim()));
+}
+const esc = (v) => /[",\n]/.test(v ?? '') ? `"${String(v).replace(/"/g, '""')}"` : (v ?? '');
+
+// ---------- input ----------
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const rows = parseCSV(reader.result.replace(/^\uFEFF/, ''));
+    headers = rows[0] || []; csvRows = rows.slice(1);
+    $('col').innerHTML = headers.map((h, i) => `<option value="${i}">${h}</option>`).join('');
+    const guess = headers.findIndex(h => /company|organi[sz]ation|account|^name$/i.test(h));
+    $('col').value = String(Math.max(guess, 0));
+    $('paste').value = '';
+    $('status').textContent = `${file.name}: ${csvRows.length} rows loaded.`;
+  };
+  reader.readAsText(file);
+}
+$('drop').onclick = () => $('file').click();
+$('file').onchange = (e) => e.target.files[0] && loadFile(e.target.files[0]);
+$('drop').ondragover = (e) => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = (e) => { e.preventDefault(); $('drop').classList.remove('over'); e.dataTransfer.files[0] && loadFile(e.dataTransfer.files[0]); };
+
+function getNames() {
+  let list;
+  if ($('paste').value.trim()) list = $('paste').value.split(/\r?\n/).map(s => s.split(',')[0]);
+  else if (csvRows) list = csvRows.map(r => r[Number($('col').value || 0)] || '');
+  else return [];
+  const seen = new Set(), out = [];
+  for (const n of list.map(s => s.trim()).filter(Boolean)) {
+    const k = n.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); out.push(n); }
+  }
+  return out;
+}
+
+// ---------- calls ----------
+const authHeaders = () => ({ 'Content-Type': 'application/json', 'x-access-code': $('code').value });
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  if (r.status === 401) throw new Error('Wrong access code');
+  if (!r.ok) throw new Error(`${url} failed (${r.status})`);
+  return r.json();
+}
+function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
+
+function setProgress(done, total, msg) {
+  $('fill').style.width = total ? `${Math.round(done / total * 100)}%` : '0';
+  $('status').textContent = msg;
+}
+
+function render() {
+  $('resultsCard').hidden = false;
+  const rows = [...results.values()];
+  $('tbody').innerHTML = rows.slice(0, 500).map(r =>
+    `<tr><td>${r.name}</td><td class="${r.domain ? '' : 'miss'}">${r.domain || 'not found'}</td><td>${r.source || ''}</td></tr>`
+  ).join('');
+  $('dl').disabled = !rows.length;
+}
+
+$('go').onclick = async () => {
+  const names = getNames();
+  if (!names.length) return ($('status').textContent = 'No company names found.');
+  localStorage.setItem('df_code', $('code').value);
+  $('go').disabled = true; results = new Map();
+  names.forEach(n => results.set(n.toLowerCase(), { name: n, domain: '', source: '' }));
+  const start = Date.now();
+
+  try {
+    // Steps 1 + 2: free sources, 25 names per request, 3 requests in flight
+    const batches = chunk(names, 25); let done = 0, next = 0;
+    async function worker() {
+      while (next < batches.length) {
+        const b = batches[next++];
+        const { results: res } = await post('/api/resolve', { names: b });
+        res.forEach(r => results.set(r.name.toLowerCase(), r));
+        done += b.length;
+        const found = [...results.values()].filter(r => r.domain).length;
+        setProgress(done, names.length, `Checked ${done}/${names.length}, found ${found}`);
+        render();
+      }
+    }
+    await Promise.all([worker(), worker(), worker()]);
+
+    // Step 3: Clay for the leftovers
+    const misses = names.filter(n => !results.get(n.toLowerCase()).domain);
+    if (misses.length && config.clay && $('useClay').checked) {
+      const jobId = crypto.randomUUID();
+      for (const b of chunk(misses, 100)) await post('/api/clay_send', { jobId, names: b });
+      await pollClay(jobId, misses);
+    }
+    const found = [...results.values()].filter(r => r.domain).length;
+    setProgress(1, 1, `Done: ${found}/${names.length} found in ${Math.round((Date.now() - start) / 1000)}s`);
+  } catch (e) {
+    $('status').textContent = `Error: ${e.message}. Partial results can still be downloaded.`;
+  }
+  render(); $('go').disabled = false;
+};
+
+async function pollClay(jobId, misses) {
+  const deadline = Date.now() + 10 * 60 * 1000; // stop waiting after 10 minutes
+  while (Date.now() < deadline) {
+    const r = await fetch(`/api/clay_status?job=${jobId}`, { headers: authHeaders() }).then(r => r.json());
+    const back = r.results || {};
+    for (const [name, d] of Object.entries(back)) {
+      if (results.has(name.toLowerCase())) results.set(name.toLowerCase(), { name, domain: d === '-' ? '' : d, source: d === '-' ? 'clay (no match)' : 'clay' });
+    }
+    const returned = Object.keys(back).length;
+    setProgress(returned, misses.length, `Clay: ${returned}/${misses.length} returned (you can download any time)`);
+    render();
+    if (returned >= misses.length) return;
+    await new Promise(r => setTimeout(r, 5000));
+  }
+}
+
+$('dl').onclick = () => {
+  const lines = [['company', 'domain', 'source']];
+  if (csvRows && !$('paste').value.trim()) {
+    // keep original row order and duplicates
+    const ci = Number($('col').value || 0);
+    csvRows.forEach(r => { const n = (r[ci] || '').trim(); const m = results.get(n.toLowerCase()) || {}; lines.push([n, m.domain || '', m.source || '']); });
+  } else {
+    results.forEach(r => lines.push([r.name, r.domain, r.source]));
+  }
+  const blob = new Blob(['\uFEFF' + lines.map(l => l.map(esc).join(',')).join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'company_domains.csv'; a.click();
+};
+</script>
+</body>
+</html>
